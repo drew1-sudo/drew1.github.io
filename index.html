@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Business Budget Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310b981'/%3E%3Ctext x='16' y='23' font-size='20' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3E%E2%82%B1%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div id="boot" class="boot"><div class="spinner"></div></div>
+
+  <!-- Sign in / register -->
+  <div id="auth-view" class="auth" hidden>
+    <section class="auth-brand">
+      <div class="brand brand-lg"><span class="brand-mark">₱</span><span>BudgetBook</span></div>
+      <h1>Know where every peso goes.</h1>
+      <p>Track income and expenses, plan budgets, and export reports for your business — all in one place.</p>
+      <ul class="auth-points">
+        <li>Live dashboard of balance, income and profit</li>
+        <li>Category budgets with overspending warnings</li>
+        <li>Monthly, quarterly and yearly PDF &amp; Excel reports</li>
+      </ul>
+    </section>
+    <section class="auth-panel">
+      <div class="auth-card">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-auth-tab="login" role="tab">Sign in</button>
+          <button class="tab" data-auth-tab="register" role="tab">Create account</button>
+        </div>
+
+        <form id="login-form" novalidate>
+          <h2>Welcome back</h2>
+          <p class="muted">Sign in to manage your business finances.</p>
+          <div class="form-error" data-form-error></div>
+          <label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" required></label>
+          <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+          <button class="btn btn-primary btn-block" type="submit">Sign in</button>
+          <div class="demo-hint">
+            <span>Just looking? Try the demo business with 12 months of sample data.</span>
+            <button type="button" class="btn btn-ghost btn-sm" id="use-demo">Use demo account</button>
+          </div>
+        </form>
+
+        <form id="register-form" novalidate hidden>
+          <h2>Create your account</h2>
+          <p class="muted">Each account keeps its own private financial records.</p>
+          <div class="form-error" data-form-error></div>
+          <div class="grid-2">
+            <label class="field"><span>Your name</span><input name="name" autocomplete="name" maxlength="80" required></label>
+            <label class="field"><span>Business name</span><input name="business_name" autocomplete="organization" maxlength="120" required></label>
+          </div>
+          <label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" maxlength="120" required></label>
+          <div class="grid-2">
+            <label class="field"><span>Password</span><input name="password" type="password" autocomplete="new-password" required></label>
+            <label class="field"><span>Confirm password</span><input name="confirm" type="password" autocomplete="new-password" required></label>
+          </div>
+          <p class="hint">At least 8 characters, with a letter and a number.</p>
+          <label class="check"><input type="checkbox" name="sample_data" checked> Start with sample business data</label>
+          <button class="btn btn-primary btn-block" type="submit">Create account</button>
+        </form>
+      </div>
+    </section>
+  </div>
+
+  <!-- Main app -->
+  <div id="app-view" class="app" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <div class="brand"><span class="brand-mark">₱</span><span class="label">BudgetBook</span></div>
+        <button class="icon-btn collapse-btn" id="collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
+      </div>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot">
+        <div class="user-chip" id="user-chip"></div>
+        <button class="nav-link" id="logout-btn" data-icon="logout"><span class="label">Sign out</span></button>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Open menu"></button>
+        <div class="topbar-title">
+          <h1 id="page-title">Dashboard</h1>
+          <span class="muted" id="page-sub"></span>
+        </div>
+        <button class="btn btn-primary" data-action="add-tx" id="topbar-add"></button>
+      </header>
+      <main id="page" class="page"></main>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toasts" aria-live="polite"></div>
+</body>
+</html>
