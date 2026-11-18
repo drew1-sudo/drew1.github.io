@@ -1,17 +1,18 @@
 'use strict';
 
-// Business Budget Tracker backend: plain Node (no npm install needed).
-// Uses the built-in node:sqlite module, so Node 22.13+ / 24+ is required.
+// Business Budget Tracker backend: plain Node plus the `pg` driver.
+// With DATABASE_URL set (e.g. Supabase) data lives in Postgres and survives restarts.
+// Without it, data goes to a local SQLite file (needs Node 22.13+ / 24+).
 
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { openDatabase } = require('./db');
 
 const PORT = Number(process.env.PORT) || 5050;
 const ROOT = __dirname;
-// On a host like Render, point DATA_DIR at a persistent disk so data survives restarts.
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 // Behind a hosting proxy (Render sets RENDER=true) the real client IP and HTTPS status come from headers.
 const BEHIND_PROXY = Boolean(process.env.RENDER || process.env.TRUST_PROXY);
@@ -32,58 +33,11 @@ const OVERALL = '__overall__';
 
 // ---------- Database ----------
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(path.join(DATA_DIR, 'budget.db'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE,
-  business_name TEXT NOT NULL,
-  opening_balance INTEGER NOT NULL DEFAULT 0,
-  password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
-  category TEXT NOT NULL,
-  amount INTEGER NOT NULL CHECK (amount > 0),
-  date TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  payment_method TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date);
-CREATE TABLE IF NOT EXISTS budgets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  period TEXT NOT NULL CHECK (period IN ('monthly', 'yearly')),
-  category TEXT NOT NULL,
-  amount INTEGER NOT NULL CHECK (amount > 0),
-  UNIQUE (user_id, period, category)
-);
-`);
+// Set in main() before the server starts listening.
+let db;
 
-function transaction(fn) {
-  db.exec('BEGIN');
-  try {
-    const result = fn();
-    db.exec('COMMIT');
-    return result;
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
-}
+// UTC timestamp in the same "YYYY-MM-DD HH:MM:SS" format SQLite's datetime('now') gives.
+const nowText = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
 
 // ---------- Passwords and sessions ----------
 
@@ -113,10 +67,10 @@ function clientIp(req) {
   return forwarded || req.socket.remoteAddress;
 }
 
-function createSession(req, res, userId) {
+async function createSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
   const expires = Date.now() + SESSION_DAYS * 864e5;
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(sha256(token), userId, expires);
+  await db.run('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)', sha256(token), userId, expires);
   res.setHeader('Set-Cookie', `sid=${token}; ${cookieFlags(req)}; Max-Age=${SESSION_DAYS * 86400}`);
 }
 
@@ -128,18 +82,20 @@ function readCookie(req, name) {
   return null;
 }
 
-function sessionUser(req) {
+async function sessionUser(req) {
   const token = readCookie(req, 'sid');
   if (!token) return null;
-  const row = db
-    .prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?')
-    .get(sha256(token), Date.now());
+  const row = await db.get(
+    'SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?',
+    sha256(token),
+    Date.now()
+  );
   return row || null;
 }
 
-function clearSession(req, res) {
+async function clearSession(req, res) {
   const token = readCookie(req, 'sid');
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+  if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
   res.setHeader('Set-Cookie', `sid=; ${cookieFlags(req)}; Max-Age=0`);
 }
 
@@ -225,7 +181,7 @@ function mulberry32(seed) {
 }
 
 // 12 months of transactions for a small café, ending today.
-function loadSampleData(userId) {
+async function loadSampleData(userId) {
   const rand = mulberry32(userId * 7919 + 17);
   const pesos = (lo, hi) => Math.round((lo + rand() * (hi - lo)) / 10) * 10 * 100;
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
@@ -287,17 +243,38 @@ function loadSampleData(userId) {
     ['yearly', 'Equipment', 20000000],
   ];
 
-  transaction(() => {
-    db.prepare('DELETE FROM transactions WHERE user_id = ?').run(userId);
-    db.prepare('DELETE FROM budgets WHERE user_id = ?').run(userId);
-    const insTx = db.prepare(
-      'INSERT INTO transactions (user_id, type, category, amount, date, description, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    );
-    for (const r of rows) insTx.run(userId, ...r);
-    const insBudget = db.prepare('INSERT INTO budgets (user_id, period, category, amount) VALUES (?, ?, ?, ?)');
-    for (const b of budgets) insBudget.run(userId, ...b);
-    db.prepare('UPDATE users SET opening_balance = ? WHERE id = ? AND opening_balance = 0').run(50000000, userId);
+  // One multi-row INSERT per table: row-by-row inserts would be ~400 network round trips to a hosted database.
+  const stamp = nowText();
+  const txGroups = rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+  const txParams = rows.flatMap((r) => [userId, ...r, stamp, stamp]);
+  const budgetGroups = budgets.map(() => '(?, ?, ?, ?)').join(', ');
+  const budgetParams = budgets.flatMap((b) => [userId, ...b]);
+
+  await db.transaction(async (t) => {
+    await t.run('DELETE FROM transactions WHERE user_id = ?', userId);
+    await t.run('DELETE FROM budgets WHERE user_id = ?', userId);
+    if (rows.length) {
+      await t.run(
+        `INSERT INTO transactions (user_id, type, category, amount, date, description, payment_method, created_at, updated_at) VALUES ${txGroups}`,
+        ...txParams
+      );
+    }
+    await t.run(`INSERT INTO budgets (user_id, period, category, amount) VALUES ${budgetGroups}`, ...budgetParams);
+    await t.run('UPDATE users SET opening_balance = ? WHERE id = ? AND opening_balance = 0', 50000000, userId);
   });
+}
+
+// Returns the new user's id.
+async function insertUser(name, email, business, password) {
+  const row = await db.get(
+    'INSERT INTO users (name, email, business_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id',
+    name,
+    email,
+    business,
+    hashPassword(password),
+    nowText()
+  );
+  return Number(row.id);
 }
 
 function ymd(d) {
@@ -307,11 +284,17 @@ function ymd(d) {
 
 // Demo account so the app has data on first launch.
 const DEMO = { email: 'demo@example.com', password: 'demo1234', name: 'Demo Owner', business: 'Bayanihan Coffee Co.' };
-if (!db.prepare('SELECT id FROM users WHERE email = ?').get(DEMO.email)) {
-  const { lastInsertRowid } = db
-    .prepare('INSERT INTO users (name, email, business_name, password_hash) VALUES (?, ?, ?, ?)')
-    .run(DEMO.name, DEMO.email, DEMO.business, hashPassword(DEMO.password));
-  loadSampleData(Number(lastInsertRowid));
+async function ensureDemoAccount() {
+  if (await db.get('SELECT id FROM users WHERE email = ?', DEMO.email)) return;
+  let userId;
+  try {
+    userId = await insertUser(DEMO.name, DEMO.email, DEMO.business, DEMO.password);
+  } catch (err) {
+    // Another server instance created it at the same moment.
+    if (await db.get('SELECT id FROM users WHERE email = ?', DEMO.email)) return;
+    throw err;
+  }
+  await loadSampleData(userId);
   console.log(`Created demo account: ${DEMO.email} / ${DEMO.password}`);
 }
 
@@ -357,17 +340,16 @@ const publicUser = (u) => ({
   created_at: u.created_at,
 });
 
-function userData(userId) {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-  return {
-    user: publicUser(user),
-    transactions: db
-      .prepare(
-        'SELECT id, type, category, amount, date, description, payment_method, created_at, updated_at FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC'
-      )
-      .all(userId),
-    budgets: db.prepare('SELECT id, period, category, amount FROM budgets WHERE user_id = ? ORDER BY period, category').all(userId),
-  };
+async function userData(userId) {
+  const [user, transactions, budgets] = await Promise.all([
+    db.get('SELECT * FROM users WHERE id = ?', userId),
+    db.all(
+      'SELECT id, type, category, amount, date, description, payment_method, created_at, updated_at FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC',
+      userId
+    ),
+    db.all('SELECT id, period, category, amount FROM budgets WHERE user_id = ? ORDER BY period, category', userId),
+  ]);
+  return { user: publicUser(user), transactions, budgets };
 }
 
 // ---------- API ----------
@@ -405,41 +387,38 @@ async function handleApi(req, res, url) {
     if (!name || name.length > 80) fields.name = 'Enter your name (max 80 characters).';
     if (!business || business.length > 120) fields.business_name = 'Enter your business name (max 120 characters).';
     if (!validEmail(email)) fields.email = 'Enter a valid email address.';
-    else if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) fields.email = 'An account with this email already exists.';
+    else if (await db.get('SELECT id FROM users WHERE email = ?', email)) fields.email = 'An account with this email already exists.';
     const pwProblem = passwordProblem(body.password);
     if (pwProblem) fields.password = pwProblem;
     if (Object.keys(fields).length) return fail(res, 422, 'Please fix the highlighted fields.', fields);
 
-    const { lastInsertRowid } = db
-      .prepare('INSERT INTO users (name, email, business_name, password_hash) VALUES (?, ?, ?, ?)')
-      .run(name, email, business, hashPassword(body.password));
-    const userId = Number(lastInsertRowid);
-    if (body.sample_data) loadSampleData(userId);
-    createSession(req, res, userId);
-    return send(res, 201, userData(userId));
+    const userId = await insertUser(name, email, business, body.password);
+    if (body.sample_data) await loadSampleData(userId);
+    await createSession(req, res, userId);
+    return send(res, 201, await userData(userId));
   }
 
   if (method === 'POST' && p === '/api/auth/login') {
     const ip = clientIp(req);
     if (tooManyFailures(ip)) return fail(res, 429, 'Too many failed attempts. Try again in 15 minutes.');
     const email = cleanText(body.email, 120).toLowerCase();
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const user = await db.get('SELECT * FROM users WHERE email = ?', email);
     if (!user || typeof body.password !== 'string' || !verifyPassword(body.password, user.password_hash)) {
       recordFailure(ip);
       return fail(res, 401, 'Incorrect email or password.');
     }
-    db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-    createSession(req, res, user.id);
-    return send(res, 200, userData(user.id));
+    await db.run('DELETE FROM sessions WHERE expires_at <= ?', Date.now());
+    await createSession(req, res, user.id);
+    return send(res, 200, await userData(user.id));
   }
 
   if (method === 'POST' && p === '/api/auth/logout') {
-    clearSession(req, res);
+    await clearSession(req, res);
     return send(res, 200, { ok: true });
   }
 
   // Everything below needs a signed-in user.
-  const user = sessionUser(req);
+  const user = await sessionUser(req);
   if (!user) return fail(res, 401, 'Please sign in.');
   const uid = user.id;
 
@@ -447,50 +426,54 @@ async function handleApi(req, res, url) {
   const demoLocked = user.email === DEMO.email && (p === '/api/account/profile' || p === '/api/account/password' || (method === 'DELETE' && p === '/api/account'));
   if (demoLocked) return fail(res, 403, "The shared demo account can't change its profile or password, or be deleted. Create your own account for that.");
 
-  if (method === 'GET' && (p === '/api/data' || p === '/api/auth/me')) return send(res, 200, userData(uid));
+  if (method === 'GET' && (p === '/api/data' || p === '/api/auth/me')) return send(res, 200, await userData(uid));
 
   if (method === 'POST' && p === '/api/transactions') {
     const { fields, value: v } = validateTransaction(body);
     if (Object.keys(fields).length) return fail(res, 422, 'Please fix the highlighted fields.', fields);
-    db.prepare(
-      'INSERT INTO transactions (user_id, type, category, amount, date, description, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(uid, v.type, v.category, v.amount, v.date, v.description, v.payment_method);
-    return send(res, 201, userData(uid));
+    const stamp = nowText();
+    await db.run(
+      'INSERT INTO transactions (user_id, type, category, amount, date, description, payment_method, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      uid, v.type, v.category, v.amount, v.date, v.description, v.payment_method, stamp, stamp
+    );
+    return send(res, 201, await userData(uid));
   }
 
   let m = p.match(/^\/api\/transactions\/(\d+)$/);
   if (m) {
     const id = Number(m[1]);
-    const existing = db.prepare('SELECT id FROM transactions WHERE id = ? AND user_id = ?').get(id, uid);
+    const existing = await db.get('SELECT id FROM transactions WHERE id = ? AND user_id = ?', id, uid);
     if (!existing) return fail(res, 404, 'Transaction not found.');
     if (method === 'PUT') {
       const { fields, value: v } = validateTransaction(body);
       if (Object.keys(fields).length) return fail(res, 422, 'Please fix the highlighted fields.', fields);
-      db.prepare(
-        "UPDATE transactions SET type = ?, category = ?, amount = ?, date = ?, description = ?, payment_method = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?"
-      ).run(v.type, v.category, v.amount, v.date, v.description, v.payment_method, id, uid);
-      return send(res, 200, userData(uid));
+      await db.run(
+        'UPDATE transactions SET type = ?, category = ?, amount = ?, date = ?, description = ?, payment_method = ?, updated_at = ? WHERE id = ? AND user_id = ?',
+        v.type, v.category, v.amount, v.date, v.description, v.payment_method, nowText(), id, uid
+      );
+      return send(res, 200, await userData(uid));
     }
     if (method === 'DELETE') {
-      db.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?').run(id, uid);
-      return send(res, 200, userData(uid));
+      await db.run('DELETE FROM transactions WHERE id = ? AND user_id = ?', id, uid);
+      return send(res, 200, await userData(uid));
     }
   }
 
   if (method === 'PUT' && p === '/api/budgets') {
     const { fields, value: v } = validateBudget(body);
     if (Object.keys(fields).length) return fail(res, 422, 'Please fix the highlighted fields.', fields);
-    db.prepare(
-      'INSERT INTO budgets (user_id, period, category, amount) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, period, category) DO UPDATE SET amount = excluded.amount'
-    ).run(uid, v.period, v.category, v.amount);
-    return send(res, 200, userData(uid));
+    await db.run(
+      'INSERT INTO budgets (user_id, period, category, amount) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, period, category) DO UPDATE SET amount = excluded.amount',
+      uid, v.period, v.category, v.amount
+    );
+    return send(res, 200, await userData(uid));
   }
 
   m = p.match(/^\/api\/budgets\/(\d+)$/);
   if (m && method === 'DELETE') {
-    const { changes } = db.prepare('DELETE FROM budgets WHERE id = ? AND user_id = ?').run(Number(m[1]), uid);
+    const { changes } = await db.run('DELETE FROM budgets WHERE id = ? AND user_id = ?', Number(m[1]), uid);
     if (!changes) return fail(res, 404, 'Budget not found.');
-    return send(res, 200, userData(uid));
+    return send(res, 200, await userData(uid));
   }
 
   if (method === 'PUT' && p === '/api/account/profile') {
@@ -502,11 +485,11 @@ async function handleApi(req, res, url) {
     if (!name || name.length > 80) fields.name = 'Enter your name (max 80 characters).';
     if (!business || business.length > 120) fields.business_name = 'Enter your business name (max 120 characters).';
     if (!validEmail(email)) fields.email = 'Enter a valid email address.';
-    else if (db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, uid)) fields.email = 'Another account already uses this email.';
+    else if (await db.get('SELECT id FROM users WHERE email = ? AND id != ?', email, uid)) fields.email = 'Another account already uses this email.';
     if (opening === null) fields.opening_balance = 'Enter a number with up to 2 decimals.';
     if (Object.keys(fields).length) return fail(res, 422, 'Please fix the highlighted fields.', fields);
-    db.prepare('UPDATE users SET name = ?, business_name = ?, email = ?, opening_balance = ? WHERE id = ?').run(name, business, email, opening, uid);
-    return send(res, 200, userData(uid));
+    await db.run('UPDATE users SET name = ?, business_name = ?, email = ?, opening_balance = ? WHERE id = ?', name, business, email, opening, uid);
+    return send(res, 200, await userData(uid));
   }
 
   if (method === 'PUT' && p === '/api/account/password') {
@@ -515,32 +498,32 @@ async function handleApi(req, res, url) {
     }
     const problem = passwordProblem(body.new_password);
     if (problem) return fail(res, 422, 'Please fix the highlighted fields.', { new_password: problem });
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(body.new_password), uid);
+    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', hashPassword(body.new_password), uid);
     // Sign out other devices, keep this one.
     const token = readCookie(req, 'sid');
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(uid, sha256(token));
+    await db.run('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?', uid, sha256(token));
     return send(res, 200, { ok: true });
   }
 
   if (method === 'POST' && p === '/api/account/sample-data') {
-    loadSampleData(uid);
-    return send(res, 200, userData(uid));
+    await loadSampleData(uid);
+    return send(res, 200, await userData(uid));
   }
 
   if (method === 'DELETE' && p === '/api/account/data') {
-    transaction(() => {
-      db.prepare('DELETE FROM transactions WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM budgets WHERE user_id = ?').run(uid);
+    await db.transaction(async (t) => {
+      await t.run('DELETE FROM transactions WHERE user_id = ?', uid);
+      await t.run('DELETE FROM budgets WHERE user_id = ?', uid);
     });
-    return send(res, 200, userData(uid));
+    return send(res, 200, await userData(uid));
   }
 
   if (method === 'DELETE' && p === '/api/account') {
     if (typeof body.password !== 'string' || !verifyPassword(body.password, user.password_hash)) {
       return fail(res, 422, 'Please fix the highlighted fields.', { password: 'Password is incorrect.' });
     }
-    db.prepare('DELETE FROM users WHERE id = ?').run(uid);
-    clearSession(req, res);
+    await db.run('DELETE FROM users WHERE id = ?', uid);
+    await clearSession(req, res);
     return send(res, 200, { ok: true });
   }
 
@@ -643,4 +626,17 @@ server.once('listening', () => {
   console.log('Keep this window open. Press Ctrl+C to stop.');
 });
 
-listen(PORT, 10);
+async function main() {
+  try {
+    db = await openDatabase({ databaseUrl: DATABASE_URL, dataDir: DATA_DIR });
+    await ensureDemoAccount();
+  } catch (err) {
+    console.error(`Could not open the database: ${err.message}`);
+    if (DATABASE_URL) console.error('Check DATABASE_URL: the password, and that it is the Session pooler string.');
+    process.exit(1);
+  }
+  console.log(db.kind === 'postgres' ? 'Saving data to Postgres (DATABASE_URL).' : `Saving data to ${path.join(DATA_DIR, 'budget.db')}.`);
+  listen(PORT, 10);
+}
+
+main();
