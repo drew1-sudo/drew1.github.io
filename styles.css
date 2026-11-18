@@ -356,3 +356,16 @@ td.actions { white-space: nowrap; text-align: right; width: 1%; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .alert a { color: inherit; font-weight: 700; }
 code { background: var(--gray-100); padding: 2px 6px; border-radius: 6px; }
+
+/* Show / hide password button inside password boxes */
+.pw-wrap { position: relative; }
+.pw-wrap input { padding-right: 44px; }
+.pw-toggle {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  width: 36px; height: 36px; display: grid; place-items: center;
+  border: 0; border-radius: 8px; background: transparent; color: var(--gray-500); cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.pw-toggle:hover { background: var(--gray-100); color: var(--navy-700); }
+.pw-toggle:focus-visible { outline: 2px solid var(--green-500); outline-offset: 1px; }
+.pw-toggle .i { width: 18px; height: 18px; }

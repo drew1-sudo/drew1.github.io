@@ -29,6 +29,8 @@ const ICONS = {
   arrowOut: '<line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/>',
   profit: '<line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>',
   calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
 };
 const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -286,7 +288,38 @@ function renderPage(animate) {
 
 // ---------- Auth ----------
 
+// Adds an eye button inside each password box that shows or hides what was typed.
+function addPasswordToggles(form) {
+  $$('input[type="password"]', form).forEach((input) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'pw-wrap';
+    input.replaceWith(wrap);
+    wrap.append(input);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pw-toggle';
+    wrap.append(btn);
+    const set = (show) => {
+      input.type = show ? 'text' : 'password';
+      btn.innerHTML = icon(show ? 'eyeOff' : 'eye');
+      btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+      btn.title = show ? 'Hide password' : 'Show password';
+      btn.setAttribute('aria-pressed', String(show));
+    };
+    set(false);
+    btn.addEventListener('click', (e) => {
+      e.preventDefault(); // keep the click from also focusing the input via its <label>
+      set(input.type === 'password');
+    });
+    // Always hide again on submit, so the password isn't left visible after signing in.
+    form.addEventListener('submit', () => set(false));
+  });
+}
+
 function bindAuth() {
+  addPasswordToggles($('#login-form'));
+  addPasswordToggles($('#register-form'));
+
   $$('[data-auth-tab]').forEach((tab) =>
     tab.addEventListener('click', () => {
       $$('[data-auth-tab]').forEach((t) => t.classList.toggle('active', t === tab));
